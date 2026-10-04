@@ -9,6 +9,7 @@ import {
   availableTiers,
   tierSpec,
   isAuto,
+  modelFitsContext,
   shouldUseExactModel,
 } from "./config.mjs";
 import { askJev } from "./router.mjs";
@@ -111,6 +112,9 @@ export function claudeModels(catalog = []) {
     .map((model) => ({
       id: model.id,
       tier: tierOf(model.id),
+      // The account reports each exact model's own limit, which is what a feasibility check
+      // has to use: an older version within a tier need not share the family's window.
+      maxInput: model.max_input_tokens ?? null,
       description: [
         model.display_name,
         model.created_at && `released ${model.created_at.slice(0, 10)}`,
@@ -161,22 +165,11 @@ export function conversationKey(body) {
   return createHash("sha1").update(`${session}|${text}`).digest("hex").slice(0, 12);
 }
 
-/**
- * Records the tier Claude Code is asking for and reports whether the user has taken manual
- * control. The first tier seen in a conversation is the baseline; any later change means the
- * user picked a model with /model, and an explicit choice must beat the router. Compared by
- * tier rather than exact model id, because Claude Code varies the id within a tier.
- */
-export function observeModel(state, current) {
-  state.baseline ??= current;
-  if (current !== state.baseline) state.manual = true;
-  return state.manual;
-}
 
 
 export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = askJev } = {}) {
   // Tier routed for each conversation's turn in flight, reused by its follow-up requests and
-  // by the cache-rebuild guard, which needs to know what the prompt cache was built on.
+  // by the downgrade guard, which needs to know what the prompt cache was built on.
   const convos = new Map();
   const catalog = new Map();
   const stateFor = (key) => {
@@ -225,22 +218,22 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             const explaining = prompt?.includes("<jev-explain>");
             let fresh = null;
             if (prompt && !explaining) {
-              const models = claudeModels([...catalog.values()]).filter((model) =>
+              const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
+              const offered = claudeModels([...catalog.values()]).filter((model) =>
                 availableTiers().includes(model.tier),
               );
+              // Drop candidates the conversation has outgrown, so a confident recommendation
+              // cannot route a large conversation into a small window. If nothing fits, the
+              // request is oversized whatever we pick, so keep the full list and let the API
+              // be the one to say so rather than silently holding the session on one tier.
+              const fitting = offered.filter((model) => modelFitsContext(model, contextTokens));
+              const models = fitting.length ? fitting : offered;
               const available = [...new Set(models.map((model) => model.tier))];
               const currentModel = state.model ?? modelForTier(models, current);
-              const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
               const jev = await route({ prompt, current: currentModel, currentTier: current, contextTokens, models });
               const chosen = models.find((model) => model.id === jev?.choice);
               const tierAnswer = jev && { ...jev, choice: chosen?.tier };
-              const { tier, reason } = decide({
-                prompt,
-                jev: tierAnswer,
-                current,
-                available,
-                contextTokens,
-              });
+              const { tier, reason } = decide({ prompt, jev: tierAnswer, current, available });
               const model =
                 shouldUseExactModel(reason, chosen?.tier, tier)
                   ? chosen.id

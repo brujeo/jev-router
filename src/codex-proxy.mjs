@@ -206,7 +206,6 @@ export async function startCodexProxy({
                 jev: jev && { ...jev, choice: chosen?.tier },
                 current,
                 available,
-                contextTokens,
               });
               tier = decision.tier;
               model =

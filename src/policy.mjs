@@ -9,7 +9,7 @@ export function detectOverride(prompt) {
 /**
  * Nearest tier the account can actually run. Prefers stepping up rather than down so we
  * never silently hand a hard task to a weaker model, but never steps up into `fable`
- * (which bills extra usage credits) unless that is what was asked for.
+ * (the most expensive tier) unless that is what was asked for.
  */
 function clampToAvailable(tier, available) {
   if (available.includes(tier)) return tier;
@@ -31,10 +31,9 @@ function clampToAvailable(tier, available) {
  * @param {?{choice: string, confidence: number}} input.jev  null when Jev failed
  * @param {string} input.current       tier currently active in the session
  * @param {string[]} input.available   tier names the account can run
- * @param {number} input.contextTokens approximate size of the conversation so far
  * @returns {{tier: string, reason: string, changed: boolean}}
  */
-export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
+export function decide({ prompt, jev, current, available }) {
   const settle = (tier, reason) => {
     const final = clampToAvailable(tier, available) ?? current;
     const why = final === tier ? reason : `${reason}+unavailable`;
@@ -54,8 +53,11 @@ export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
     if (rankOf(target) > ceiling) return settle(TIER_NAMES[ceiling], "low-confidence-capped");
   }
 
-  if (rankOf(target) < rankOf(current) && contextTokens > THRESHOLDS.downgradeMaxContextTokens) {
-    return settle(current, "downgrade-not-worth-cache-rebuild");
+  // A downgrade is only worth the cache rebuild if the cheaper model finishes the work;
+  // see THRESHOLDS.downgradeMinConfidence for why this is a confidence test and not a
+  // conversation-size one.
+  if (rankOf(target) < rankOf(current) && jev.confidence < THRESHOLDS.downgradeMinConfidence) {
+    return settle(current, "downgrade-confidence-too-low");
   }
 
   return settle(target, "jev");

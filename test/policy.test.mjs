@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { decide, detectOverride } from "../src/policy.mjs";
-import { QUESTIONS, shouldUseExactModel } from "../src/config.mjs";
+import { QUESTIONS, modelFitsContext, shouldUseExactModel } from "../src/config.mjs";
 
 const ALL = ["haiku", "sonnet", "opus", "fable"];
 const sure = (choice) => ({ choice, confidence: 0.95 });
@@ -63,14 +63,49 @@ test("still allows a confident upgrade to fable", () => {
   assert.equal(decide({ ...base, jev: sure("fable") }).tier, "fable");
 });
 
-test("refuses a downgrade once the cache rebuild costs more than it saves", () => {
-  const out = decide({ ...base, current: "opus", jev: sure("haiku"), contextTokens: 80000 });
+test("refuses a downgrade Jev is not confident about", () => {
+  const out = decide({ ...base, current: "opus", jev: { choice: "haiku", confidence: 0.5 } });
   assert.equal(out.tier, "opus");
-  assert.match(out.reason, /cache-rebuild/);
+  assert.match(out.reason, /downgrade-confidence-too-low/);
 });
 
-test("allows the same downgrade early in a conversation", () => {
+test("allows the same downgrade once Jev is confident", () => {
   assert.equal(decide({ ...base, current: "opus", jev: sure("haiku") }).tier, "haiku");
+});
+
+test("conversation size does not decide a downgrade", () => {
+  // The rebuild cost scales with the conversation and so does most of the saving it buys, so
+  // size is not what policy weighs. Whether the target can still *hold* the conversation is a
+  // separate feasibility question, filtered out of the candidate list before decide() runs --
+  // hence sonnet here, whose window is the same 1M as opus.
+  for (const contextTokens of [0, 20_000, 100_000, 900_000]) {
+    const out = decide({ ...base, current: "opus", jev: sure("sonnet"), contextTokens });
+    assert.equal(out.tier, "sonnet", `blocked at ${contextTokens} tokens`);
+  }
+});
+
+test("the confidence bar applies only downward", () => {
+  // An upgrade rebuilds the same cache, but buying capability is the safe direction, so it
+  // is governed by minConfidence/uncertainCeiling rather than the downgrade bar.
+  const mid = { choice: "opus", confidence: 0.5 };
+  assert.equal(decide({ ...base, current: "sonnet", jev: mid }).tier, "opus");
+});
+
+test("the effective downgrade bar is max(minConfidence, downgradeMinConfidence)", () => {
+  // Two thresholds govern downgrades, and the stricter always wins. Lowering
+  // downgradeMinConfidence below minConfidence would NOT lower the effective bar, because the
+  // minConfidence branch runs first -- only the reason string changes. Pin both boundaries.
+  const at = (confidence) =>
+    decide({ ...base, current: "opus", jev: { choice: "sonnet", confidence } });
+
+  assert.match(at(0.29).reason, /low-confidence-no-downgrade/);
+  assert.match(at(0.3).reason, /downgrade-confidence-too-low/); // minConfidence is exclusive
+  assert.match(at(0.69).reason, /downgrade-confidence-too-low/);
+  assert.equal(at(0.7).tier, "sonnet"); // the bar itself is inclusive
+  assert.equal(at(0.71).tier, "sonnet");
+  for (const c of [0.29, 0.3, 0.69]) {
+    assert.equal(at(c).tier, "opus", `downgrade leaked through at ${c}`);
+  }
 });
 
 test("substitutes upward when the chosen tier is unavailable", () => {
@@ -110,4 +145,25 @@ test("tier opt-in flags accept the spellings a .env file invites", async (t) => 
   process.env.JEV_ALLOW_FABLE = "true";
   process.env.JEV_ALLOW_HAIKU = "false";
   assert.deepEqual(availableTiers(), ["sonnet", "opus", "fable"]);
+});
+
+test("a conversation cannot be routed into a window it has outgrown", () => {
+  // Feasibility is enforced on the candidate list, not in decide(): the exact limit the
+  // account reported wins over the tier's family window, since an older version within a
+  // tier need not match it.
+  const haiku = { id: "claude-haiku-4-5", tier: "haiku", maxInput: 200_000 };
+  const sonnet = { id: "claude-sonnet-5", tier: "sonnet", maxInput: 1_000_000 };
+
+  assert.equal(modelFitsContext(haiku, 50_000), true);
+  assert.equal(modelFitsContext(haiku, 200_000), true); // exactly at the limit still fits
+  assert.equal(modelFitsContext(haiku, 200_001), false);
+  assert.equal(modelFitsContext(sonnet, 900_000), true);
+
+  // An exact limit narrower than its family window is respected.
+  assert.equal(modelFitsContext({ tier: "sonnet", maxInput: 200_000 }, 500_000), false);
+  // With no reported limit, fall back to the tier's window.
+  assert.equal(modelFitsContext({ tier: "haiku" }, 500_000), false);
+  assert.equal(modelFitsContext({ tier: "opus" }, 500_000), true);
+  // An unknown tier falls back to the conservative 200k default.
+  assert.equal(modelFitsContext({ tier: "nonesuch" }, 500_000), false);
 });

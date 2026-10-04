@@ -39,8 +39,13 @@ export const tierOf = (model) =>
   TIERS.find((t) => typeof model === "string" && model.includes(t.family))?.name ?? null;
 
 /**
- * Fable bills extra usage credits, so it is opt-in. Everything else is covered by a normal
- * subscription.
+ * Fable is opt-in because it is the most expensive tier and overkill for most work.
+ *
+ * Not because of how it bills, as an earlier comment here claimed: the proxy forwards the
+ * caller's authentication headers unchanged and substitutes no credential of its own, so
+ * billing follows the upstream account's own entitlement and usage rules. Observed on a
+ * Claude Code subscription, Fable bills to the subscription -- recorded as an observation
+ * of one configuration, not a guarantee for every account or platform.
  *
  * Haiku is excluded for a different reason: at 200k it is the only tier whose context window
  * is not 1M, which is what stops the session declaring a single honest context budget (Claude
@@ -68,11 +73,35 @@ export const THRESHOLDS = {
   /** Safest tier to land on when Jev is unsure. */
   uncertainCeiling: "sonnet",
   /**
-   * Switching models invalidates the prompt cache; the next turn re-sends the whole
-   * conversation. Measured at ~23.6k cache-creation tokens switching into Opus, so a
-   * downgrade only pays off while the conversation is still small.
+   * Confidence a downgrade has to clear, over and above `minConfidence`. The effective bar is
+   * `max(minConfidence, downgradeMinConfidence)`, because the `minConfidence` branch runs
+   * first -- lowering this below that only changes which reason is reported.
+   *
+   * This replaced a `contextTokens > 20000` guard. Switching tiers invalidates the prompt
+   * cache, so the next request re-sends the prefix as cache-creation tokens; the old guard
+   * refused downgrades once a conversation passed 20k on the reasoning that the rebuild had
+   * stopped being worth it. That threshold was an uncalibrated approximation and it blocks
+   * switches that are profitable over a long enough run: the rebuild scales with the prefix
+   * and so does most of the saving it buys, so payback is counted in *requests*, not tokens --
+   * roughly 1-8 for opus->sonnet across the whole range of context sizes.
+   *
+   * Those figures are an estimate, not a measurement: they assume a stable cacheable prefix,
+   * a warm old cache against a cold new one, comparable output volume per request, the 5-minute
+   * TTL, and published per-MTok rates (cache reads for some exact models were not published
+   * and were taken as the documented 0.1x-of-input default). They also say nothing about how
+   * many requests a given session has left, which is what actually determines whether a
+   * switch pays off -- a large conversation offers no lower bound on its own remaining length.
+   * Note too that one routed user turn can issue many API requests as tools run.
+   *
+   * So the number below is not derived. It is a deliberately conservative operating point for
+   * the thing the economics cannot settle: whether the cheaper model can finish the work.
+   * Jev's confidence is the only signal to hand for that, and it is a proxy at best -- it
+   * reports confidence in picking the cheapest adequate *model id*, which is not a calibrated
+   * probability of task success, and it is computed from the latest prompt rather than the
+   * conversation's substance. Treat 0.7 as a heuristic awaiting measurement of real
+   * post-downgrade outcomes (rework, escalation, request count) by confidence band.
    */
-  downgradeMaxContextTokens: 20000,
+  downgradeMinConfidence: 0.7,
   /**
    * Per-attempt Jev HTTP timeout and the hard wall-clock deadline for the whole routing
    * call. Measured: ~300-350ms warm, ~900-1000ms on the first call (TLS handshake), so the
@@ -99,6 +128,18 @@ export const CONTEXT_WINDOWS = {
  * if the tier is unknown.
  */
 export const contextWindowForTier = (tierName) => CONTEXT_WINDOWS[tierName] ?? 200000;
+
+/**
+ * Whether a conversation still fits a candidate model's context window.
+ *
+ * Feasibility, not economics: routing a conversation to a model that cannot hold it is a
+ * hard API rejection, not an expensive choice, so it is filtered out of the candidate list
+ * before Jev ever sees it rather than weighed against cost in `decide()`. Prefers the exact
+ * limit the account reported for that model over the tier's family window, because an older
+ * version within a tier need not match it.
+ */
+export const modelFitsContext = (model, contextTokens = 0) =>
+  contextTokens <= (model?.maxInput ?? contextWindowForTier(model?.tier));
 
 const COMPLEXITY_SCALE = [
   "None",
