@@ -193,9 +193,13 @@ One Jev call per fresh user turn selects a shared abstract tier:
 - explicit requests such as `use opus`, `use luna`, or `use strong` win;
 - failure, timeout, or an unrecognised Jev answer keeps the current model;
 - low confidence never downgrades and caps upgrades at the balanced tier;
-- large conversations refuse downgrades that would waste more prompt-cache work than they save;
+- downgrades need higher confidence than upgrades, because switching rebuilds the prompt
+  cache and a cheaper model that cannot finish the work costs more than it saves;
+- a tier whose context window the conversation has outgrown is never offered;
 - unavailable tiers step upward rather than silently choosing a weaker model;
-- the long tier is disabled unless `JEV_ALLOW_FABLE=1`.
+- the long tier is disabled unless `JEV_ALLOW_FABLE` is set (`1`, `true`, `yes` or `on`);
+- the fast tier is disabled unless `JEV_ALLOW_HAIKU` is set the same way, because it is the
+  only tier whose context window is not 1M.
 
 Tool-loop continuations keep the tier chosen at the start of the turn. Main conversations and
 sub-agents are pinned separately. Routing is fail-open: Jev failure never blocks the CLI.
