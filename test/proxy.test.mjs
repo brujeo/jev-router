@@ -265,6 +265,28 @@ test("a prompt that is only a system reminder is not a turn", () => {
   assert.equal(newTurnPrompt(body), null);
 });
 
+test("reads a new turn behind context a hook appended after it", () => {
+  const body = withTools([
+    { role: "user", content: "fix the bug" },
+    { role: "system", content: [{ type: "text", text: "SessionStart hook additional context: ..." }] },
+  ]);
+  assert.equal(newTurnPrompt(body), "fix the bug");
+});
+
+test("ignores a tool_result continuation behind appended hook context", () => {
+  const body = withTools([
+    { role: "user", content: "fix the bug" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+    { role: "system", content: "UserPromptSubmit hook additional context: ..." },
+  ]);
+  assert.equal(newTurnPrompt(body), null);
+});
+
+test("a request of nothing but system messages is not a turn", () => {
+  assert.equal(newTurnPrompt(withTools([{ role: "system", content: "context" }])), null);
+});
+
 test("routing to haiku strips fields haiku cannot accept", () => {
   const body = {
     model: "claude-sonnet-4-6",
