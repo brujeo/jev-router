@@ -200,6 +200,12 @@ One Jev call per fresh user turn selects a shared abstract tier:
   fits none of them only the roomiest are offered. Claude only -- the Codex path does not
   filter on capacity;
 - unavailable tiers step upward rather than silently choosing a weaker model;
+- if the settled tier has no model the conversation still fits, routing moves to the
+  roomiest candidate and reports it as a capacity move -- the one case that may enter an
+  opted-in paid tier without being asked, because cost cannot be honoured when nothing else
+  holds the conversation;
+- an explicit `thinking: {type: "disabled"}` is dropped for the exact model versions that
+  reject it rather than forwarded as a certain error; versions that accept it keep it;
 - the long tier is disabled unless `JEV_ALLOW_FABLE` is set (`1`, `true`, `yes` or `on`);
 - the fast tier is disabled unless `JEV_ALLOW_HAIKU` is set the same way, because it is the
   only tier whose context window is not 1M.

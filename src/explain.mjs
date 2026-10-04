@@ -17,6 +17,7 @@ const decision = (reason = "") => {
   if (reason.includes("+capacity")) return "moved to fit the context";
   if (reason.includes("override")) return "prompt override";
   if (reason.includes("jev-unavailable")) return "Jev unavailable; held";
+  if (reason.includes("jev-invalid-choice")) return "Jev named an unknown model; held";
   if (reason.includes("low-confidence-no-downgrade")) return "low confidence; held";
   if (reason.includes("low-confidence-capped")) return "low confidence; capped";
   if (reason.includes("downgrade-confidence-too-low")) return "downgrade not confident enough";

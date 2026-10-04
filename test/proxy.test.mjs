@@ -13,6 +13,7 @@ import {
   sessionOf,
   startProxy,
 } from "../src/proxy.mjs";
+import { defaultCandidates } from "../src/config.mjs";
 
 test("only the sentinel model is routed", () => {
   assert.equal(isAuto("jev-router"), true);
@@ -477,4 +478,100 @@ test("the size estimate counts tools and system, not just messages", () => {
   assert(withTools > bare + 900, "a large tool surface must raise the estimate");
   assert(withSystem > bare + 900, "a large system prompt must raise the estimate");
   assert.equal(estimateInputTokens({}), 0);
+});
+
+/** An upstream that serves a model catalog and records every forwarded request body. */
+async function catalogUpstream(t, models) {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if ((req.url ?? "").startsWith("/v1/models")) {
+        return res.end(JSON.stringify({ data: models }));
+      }
+      seen.push(JSON.parse(Buffer.concat(chunks).toString()));
+      res.end(JSON.stringify({ id: "msg", type: "message", model: "x" }));
+    });
+  });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  t.after(() => upstream.close());
+  return { seen, url: `http://127.0.0.1:${upstream.address().port}` };
+}
+
+const turn = (port, text, extra = {}) =>
+  fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "jev-router",
+      tools: [{ name: "Bash" }],
+      messages: [{ role: "user", content: text }],
+      ...extra,
+    }),
+  });
+
+test("a catalog of only gated-off tiers still forwards a model from a candidate list", async (t) => {
+  // Regression: this forwarded the static opus default with no candidate behind it.
+  const { seen, url } = await catalogUpstream(t, [{ id: "claude-haiku-4-5", max_input_tokens: 200000 }]);
+  const { port, close } = await startProxy({ upstreamURL: url, route: async () => null });
+  t.after(close);
+
+  await fetch(`http://127.0.0.1:${port}/v1/models`);
+  await turn(port, `gated catalog ${process.pid}`);
+
+  assert.equal(seen.length, 1);
+  // Haiku is the only catalog model and is gated off, so the documented fallback set is used;
+  // whatever is forwarded must be a model from it, never the sentinel.
+  assert.notEqual(seen[0].model, "jev-router");
+  assert.ok(
+    defaultCandidates().some((m) => m.id === seen[0].model),
+    `forwarded ${seen[0].model}, which is not in the fallback candidate set`,
+  );
+  // The discriminating assertion: the broken version skipped routing entirely and let the
+  // rewrite name a static default, so no decision existed to explain what was sent. Checking
+  // the forwarded id alone cannot tell the two apart -- the static default is in the fallback
+  // set too.
+  const status = readStatus(conversationKey({ messages: [{ role: "user", content: `gated catalog ${process.pid}` }] }));
+  assert.ok(status, "a model was forwarded with no routing decision behind it");
+  assert.equal(status.model, seen[0].model, "the recorded decision disagrees with what was sent");
+});
+
+test("a held turn replaces a pinned model the conversation has outgrown", async (t) => {
+  const { seen, url } = await catalogUpstream(t, [
+    { id: "claude-opus-4-1", max_input_tokens: 200000 },
+    { id: "claude-opus-5-5", max_input_tokens: 1000000 },
+    { id: "claude-sonnet-5-5", max_input_tokens: 1000000 },
+  ]);
+  // Jev keeps asking for sonnet, never confidently enough to clear the downgrade bar.
+  const { port, close } = await startProxy({
+    upstreamURL: url,
+    route: async () => ({ choice: "claude-sonnet-5-5", confidence: 0.5, ms: 1 }),
+  });
+  t.after(close);
+  await fetch(`http://127.0.0.1:${port}/v1/models`);
+
+  const convo = `outgrow me ${process.pid}`;
+  await turn(port, convo); // small first turn: pins some opus
+  // Same conversation, now far past the smaller window.
+  await turn(port, convo, {
+    messages: [{ role: "user", content: convo }, { role: "user", content: "x".repeat(3_000_000) }],
+  });
+
+  assert.equal(seen.length, 2);
+  assert.notEqual(seen[1].model, "claude-opus-4-1", "forwarded a model the conversation outgrew");
+  assert.equal(seen[1].model, "claude-opus-5-5");
+});
+
+test("a request a model cannot be told to stop thinking about keeps working", async (t) => {
+  const { seen, url } = await catalogUpstream(t, [{ id: "claude-opus-5-5", max_input_tokens: 1000000 }]);
+  const { port, close } = await startProxy({ upstreamURL: url, route: async () => null });
+  t.after(close);
+  await fetch(`http://127.0.0.1:${port}/v1/models`);
+
+  await turn(port, `no thinking please ${process.pid}`, { thinking: { type: "disabled" } });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].model, "claude-opus-5-5");
+  assert.equal("thinking" in seen[0], false, "an opt-out this model rejects must not be forwarded");
 });

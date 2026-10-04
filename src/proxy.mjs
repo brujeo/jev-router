@@ -8,6 +8,8 @@ import {
   idOf,
   availableTiers,
   contextWindowForTier,
+  defaultCandidates,
+  rejectsDisabledThinking,
   tierSpec,
   isAuto,
   modelFitsContext,
@@ -103,10 +105,14 @@ export function applyTier(body, tierName, model = idOf(tierName)) {
     delete body.output_config.effort;
     if (Object.keys(body.output_config).length === 0) delete body.output_config;
   }
-  // Tiers that cannot be told not to think reject an explicit opt-out outright, so routing a
-  // thinking-disabled request into one has to drop the field rather than forward it. Omitting
-  // it leaves the model on adaptive thinking, which is what these tiers do by default anyway.
-  if (tier.mustThink && body.thinking?.type === "disabled") delete body.thinking;
+  // Some exact models reject an explicit thinking opt-out rather than honouring it, so
+  // forwarding one is a guaranteed 400. Dropping the field leaves the model on its default
+  // adaptive thinking, which is not what the caller asked for -- so it is decided per model
+  // version, never per family, and never for a model that would have accepted the request.
+  if (body.thinking?.type === "disabled" && rejectsDisabledThinking(model)) {
+    delete body.thinking;
+    debug(`${model} rejects disabled thinking; dropped the opt-out`);
+  }
   return body;
 }
 
@@ -297,13 +303,13 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             const prompt = newTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>");
             let fresh = null;
-            const offered = claudeModels([...catalog.values()]).filter((model) =>
+            const enabled = claudeModels([...catalog.values()]).filter((model) =>
               availableTiers().includes(model.tier),
             );
-            // No candidates at all -- a catalog whose every recognised tier is gated off by
-            // the opt-in flags. There is nothing to choose between, and inventing a static id
-            // here would forward a model no filter ever saw, so the turn is left alone.
-            if (prompt && !explaining && offered.length) {
+            // Never empty: a catalog reporting only gated-off tiers would otherwise filter to
+            // nothing and leave the rewrite naming a model no candidate list ever contained.
+            const offered = enabled.length ? enabled : defaultCandidates();
+            if (prompt && !explaining) {
               const contextTokens = estimateInputTokens(body);
               const { models, oversized } = feasibleModels(offered, contextTokens);
               if (oversized) {
@@ -343,8 +349,6 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
                 `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
                   `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
               );
-            } else if (prompt && !explaining) {
-              debug(`${key} no candidate models available; leaving ${current} alone`);
             }
             // The sentinel is not a real model, so every routed request must be rewritten,
             // including follow-ups that reuse the tier chosen for the turn.

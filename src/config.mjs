@@ -7,24 +7,16 @@ import { choice, score } from "@typesafe-ai/sdk";
  * whatever model Claude Code asked for, which may be an older version within the same tier
  * such as `claude-sonnet-4-6`.
  *
- * The flags describe what a tier's request body may contain. `thinking` and `effort` are
- * capabilities: Haiku supports neither adaptive thinking nor effort, so those fields are
- * stripped when routing down to it. `mustThink` is the opposite -- the tier rejects an
- * explicit `thinking: {type: "disabled"}` outright, so the field has to be dropped rather
- * than forwarded, which leaves the model on its default adaptive thinking.
- *
- * `mustThink` is deliberately conservative at the family level. A catalog can offer two
- * versions of one tier that disagree (Opus 5 accepts disabled thinking at effort `high` or
- * below; Opus 5.5 rejects it at every effort), and `tierOf()` maps both to `opus`, so the
- * flag cannot distinguish them. Dropping the field for the whole family is safe either way:
- * on the version that would have accepted it the model simply thinks adaptively, where the
- * alternative on the version that does not is a hard 400.
+ * `thinking` and `effort` are capabilities of the whole family: Haiku supports neither
+ * adaptive thinking nor effort, so those fields are stripped when routing down to it.
+ * Anything that differs between versions of one tier does not belong here -- see
+ * `rejectsDisabledThinking`.
  */
 export const TIERS = [
   { name: "haiku", id: "claude-haiku-4-5", family: "haiku", thinking: false, effort: false },
-  { name: "sonnet", id: "claude-sonnet-5-5", family: "sonnet", thinking: true, effort: true, mustThink: true },
-  { name: "opus", id: "claude-opus-5-5", family: "opus", thinking: true, effort: true, mustThink: true },
-  { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true, mustThink: true },
+  { name: "sonnet", id: "claude-sonnet-5-5", family: "sonnet", thinking: true, effort: true },
+  { name: "opus", id: "claude-opus-5-5", family: "opus", thinking: true, effort: true },
+  { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true },
 ];
 
 export const TIER_NAMES = TIERS.map((t) => t.name);
@@ -78,6 +70,43 @@ export const availableTiers = () =>
       (n !== "fable" || envFlag("JEV_ALLOW_FABLE")) &&
       (n !== "haiku" || envFlag("JEV_ALLOW_HAIKU")),
   );
+
+/**
+ * Candidate set to route among when the account catalog reports nothing in an enabled tier.
+ *
+ * An account can report only models whose tiers the opt-in flags disable -- a Haiku-only
+ * catalog with `JEV_ALLOW_HAIKU` off. Filtering that to nothing is worse than it sounds: the
+ * rewrite still has to name some model, so it would fall back to a tier's static default with
+ * no candidate behind it and no decision recorded. Keeping a documented fallback set means
+ * the candidate list is never empty, so every forwarded model came from one.
+ */
+export const defaultCandidates = () =>
+  TIERS.filter((tier) => availableTiers().includes(tier.name)).map((tier) => ({
+    id: tier.id,
+    tier: tier.name,
+    maxInput: null,
+    description: tier.id,
+  }));
+
+/**
+ * Exact models that reject `thinking: {type: "disabled"}` instead of honouring it.
+ *
+ * Deliberately matched per version rather than per family. Opus 5 accepts the opt-out at
+ * effort `high` or below while Opus 5.5 rejects it at every effort, and `applyTier` is handed
+ * the exact model id, so there is no reason to decide for a whole tier and silently rewrite a
+ * request a model would have accepted. Sourced from the Claude API model documentation rather
+ * than observed rejections; an id absent from this list is assumed to accept the opt-out,
+ * which is the direction that preserves what the caller asked for.
+ */
+const REJECTS_DISABLED_THINKING = [
+  /^claude-opus-5-5/,
+  /^claude-sonnet-5-5/,
+  /^claude-fable-5/,
+  /^claude-mythos-5/,
+];
+
+export const rejectsDisabledThinking = (model) =>
+  REJECTS_DISABLED_THINKING.some((re) => re.test(model ?? ""));
 
 export const THRESHOLDS = {
   /** Below this Jev confidence we refuse to downgrade and cap upgrades at `uncertainCeiling`. */

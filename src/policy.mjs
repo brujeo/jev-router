@@ -10,6 +10,12 @@ export function detectOverride(prompt) {
  * Nearest tier the account can actually run. Prefers stepping up rather than down so we
  * never silently hand a hard task to a weaker model, but never steps up into `fable`
  * (the most expensive tier) unless that is what was asked for.
+ *
+ * That refusal is about cost, so it has one documented exception outside this function:
+ * when nothing else can hold the conversation, `resolveModel` enters the roomiest eligible
+ * tier regardless and reports the move as `+capacity`. Fable still requires its opt-in to
+ * be a candidate at all, so this widens what an opted-in account may be charged for, not
+ * who can be charged.
  */
 function clampToAvailable(tier, available) {
   if (available.includes(tier)) return tier;
@@ -43,7 +49,12 @@ export function decide({ prompt, jev, current, available }) {
   const override = detectOverride(prompt);
   if (override) return settle(override, "override");
 
-  if (!jev || !TIER_NAMES.includes(jev.choice)) return settle(current, "jev-unavailable");
+  if (!jev) return settle(current, "jev-unavailable");
+  // An answer naming a model outside the candidate list is a different problem from no
+  // answer at all: a stale catalog, a contract drift, or a filter that removed the model
+  // after it was offered. Holding is the right fallback either way, but reporting it as an
+  // outage hides a misconfiguration that will not fix itself.
+  if (!TIER_NAMES.includes(jev.choice)) return settle(current, "jev-invalid-choice");
 
   let target = jev.choice;
 
