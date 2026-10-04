@@ -58,6 +58,9 @@ export function formatExplanation(status) {
     row(),
     row(`Confidence: ${status.confidence == null ? "n/a" : `${Math.round(status.confidence * 100)}%`}`),
     ...wrapped("Decision: ", decision(status.reason)),
+    // A routing reason says which model was chosen; an adaptation says what had to be changed
+    // about the request to send it there. The second is invisible otherwise.
+    ...(status.adapted?.length ? wrapped("Adapted: ", status.adapted.join(", ")) : []),
     `└${"─".repeat(WIDTH)}┘`,
   ].join("\n");
 }

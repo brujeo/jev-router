@@ -514,12 +514,33 @@ const turn = (port, text, extra = {}) =>
 
 test("a catalog of only gated-off tiers still forwards a model from a candidate list", async (t) => {
   // Regression: this forwarded the static opus default with no candidate behind it.
+  // Isolated from the ambient environment: with haiku enabled the catalog is usable and this
+  // test would pass without ever exercising the fallback.
+  const saved = process.env.JEV_ALLOW_HAIKU;
+  process.env.JEV_ALLOW_HAIKU = "false";
+  t.after(() => {
+    if (saved === undefined) delete process.env.JEV_ALLOW_HAIKU;
+    else process.env.JEV_ALLOW_HAIKU = saved;
+  });
+
   const { seen, url } = await catalogUpstream(t, [{ id: "claude-haiku-4-5", max_input_tokens: 200000 }]);
-  const { port, close } = await startProxy({ upstreamURL: url, route: async () => null });
+  let offered = null;
+  const { port, close } = await startProxy({
+    upstreamURL: url,
+    route: async ({ models }) => {
+      offered = models.map((m) => m.id);
+      return null;
+    },
+  });
   t.after(close);
 
   await fetch(`http://127.0.0.1:${port}/v1/models`);
   await turn(port, `gated catalog ${process.pid}`);
+
+  // Establishes which path ran: the classifier saw the static fallback, not the gated catalog.
+  assert.ok(offered, "the classifier was never called");
+  assert.equal(offered.includes("claude-haiku-4-5"), false, "a gated-off tier was offered");
+  assert.deepEqual(offered, defaultCandidates().map((m) => m.id));
 
   assert.equal(seen.length, 1);
   // Haiku is the only catalog model and is gated off, so the documented fallback set is used;
@@ -560,11 +581,13 @@ test("a held turn replaces a pinned model the conversation has outgrown", async 
   });
 
   assert.equal(seen.length, 2);
-  assert.notEqual(seen[1].model, "claude-opus-4-1", "forwarded a model the conversation outgrew");
-  assert.equal(seen[1].model, "claude-opus-5-5");
+  // Without this the test passes even if catalog handling regressed and the larger model was
+  // used from the start -- there would be nothing to outgrow.
+  assert.equal(seen[0].model, "claude-opus-4-1", "the first turn did not pin the smaller model");
+  assert.equal(seen[1].model, "claude-opus-5-5", "forwarded a model the conversation outgrew");
 });
 
-test("a request a model cannot be told to stop thinking about keeps working", async (t) => {
+test("a thinking opt-out is removed before a model that rejects it", async (t) => {
   const { seen, url } = await catalogUpstream(t, [{ id: "claude-opus-5-5", max_input_tokens: 1000000 }]);
   const { port, close } = await startProxy({ upstreamURL: url, route: async () => null });
   t.after(close);
@@ -574,4 +597,63 @@ test("a request a model cannot be told to stop thinking about keeps working", as
   assert.equal(seen.length, 1);
   assert.equal(seen[0].model, "claude-opus-5-5");
   assert.equal("thinking" in seen[0], false, "an opt-out this model rejects must not be forwarded");
+});
+
+test("a capacity move is carried into the next turn's downgrade classification", async (t) => {
+  // The state-propagation defect in full: a capacity fallback changes tier, and the *next*
+  // turn has to compare against the tier actually running. If it compared against the tier
+  // policy had settled on, the real downgrade would be invisible and skip the confidence bar.
+  const saved = process.env.JEV_ALLOW_FABLE;
+  process.env.JEV_ALLOW_FABLE = "true";
+  t.after(() => {
+    if (saved === undefined) delete process.env.JEV_ALLOW_FABLE;
+    else process.env.JEV_ALLOW_FABLE = saved;
+  });
+
+  // Only fable can hold a large conversation; opus is present but too small.
+  const { seen, url } = await catalogUpstream(t, [
+    { id: "claude-opus-5-5", max_input_tokens: 200_000 },
+    { id: "claude-fable-5-1", max_input_tokens: 1_000_000 },
+  ]);
+  const { port, close } = await startProxy({
+    upstreamURL: url,
+    // Jev asks for opus throughout, never confidently enough to clear the downgrade bar.
+    route: async () => ({ choice: "claude-opus-5-5", confidence: 0.5, ms: 1 }),
+  });
+  t.after(close);
+  await fetch(`http://127.0.0.1:${port}/v1/models`);
+
+  const convo = `capacity carry ${process.pid}`;
+  // Turn 1: past opus's window, so the only candidate that fits is fable.
+  await turn(port, convo, {
+    messages: [{ role: "user", content: convo }, { role: "user", content: "x".repeat(2_000_000) }],
+  });
+  assert.equal(seen[0].model, "claude-fable-5-1", "did not move to the only tier that fits");
+
+  const status = readStatus(conversationKey({ messages: [{ role: "user", content: convo }] }));
+  assert.equal(status.tier, "fable", "recorded the settled tier instead of the one running");
+  assert.match(status.reason, /\+capacity/);
+
+  // Turn 2: small again, so opus is eligible and Jev's 0.5 opus answer is now a real
+  // fable->opus downgrade. It must be recognised as one and held.
+  await turn(port, convo);
+  assert.equal(seen[1].model, "claude-fable-5-1", "a low-confidence downgrade was let through");
+  const after = readStatus(conversationKey({ messages: [{ role: "user", content: convo }] }));
+  assert.match(after.reason, /downgrade-confidence-too-low/, `reason was ${after.reason}`);
+});
+
+test("a model that accepts a thinking opt-out keeps it", async (t) => {
+  // The counterpart to dropping it: opus 5 honours the opt-out at effort high or below, so
+  // rewriting that request would change behaviour for no reason.
+  const { seen, url } = await catalogUpstream(t, [{ id: "claude-opus-5", max_input_tokens: 1_000_000 }]);
+  const { port, close } = await startProxy({ upstreamURL: url, route: async () => null });
+  t.after(close);
+  await fetch(`http://127.0.0.1:${port}/v1/models`);
+
+  await turn(port, `keep my opt-out ${process.pid}`, {
+    thinking: { type: "disabled" },
+    output_config: { effort: "high" },
+  });
+  assert.equal(seen[0].model, "claude-opus-5");
+  assert.deepEqual(seen[0].thinking, { type: "disabled" }, "an opt-out this model accepts was removed");
 });

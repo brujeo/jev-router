@@ -89,24 +89,43 @@ export const defaultCandidates = () =>
   }));
 
 /**
- * Exact models that reject `thinking: {type: "disabled"}` instead of honouring it.
+ * Whether an exact model rejects `thinking: {type: "disabled"}` instead of honouring it.
  *
- * Deliberately matched per version rather than per family. Opus 5 accepts the opt-out at
- * effort `high` or below while Opus 5.5 rejects it at every effort, and `applyTier` is handed
- * the exact model id, so there is no reason to decide for a whole tier and silently rewrite a
- * request a model would have accepted. Sourced from the Claude API model documentation rather
- * than observed rejections; an id absent from this list is assumed to accept the opt-out,
- * which is the direction that preserves what the caller asked for.
+ * Matched per version, not per family, because versions of one tier disagree and `applyTier`
+ * is handed the exact id: deciding for a whole family would rewrite requests a model would
+ * have accepted. Matched as whole ids (with an optional dated snapshot suffix) rather than
+ * prefixes, so a future `claude-opus-5-6` is not silently governed by the `5-5` rule.
+ *
+ * Two groups, because the constraint is not uniform. Opus 5.5, Sonnet 5.5 and the Fable and
+ * Mythos 5.x models reject the opt-out at every effort level. Opus 5 and Sonnet 5 accept it
+ * only at effort `high` or below and reject it at `xhigh` and `max`, so for those the answer
+ * depends on `output_config.effort` as well as the id.
+ *
+ * Sourced from the per-model migration notes in the Claude API documentation
+ * (platform.claude.com/docs -> "Migrating to Claude Opus 5.5" / "... Sonnet 5.5" /
+ * "... Fable 5.1"), not from observed rejections -- so a model absent from both groups is
+ * assumed to accept the opt-out, which is the direction that preserves the caller's request.
  */
-const REJECTS_DISABLED_THINKING = [
-  /^claude-opus-5-5/,
-  /^claude-sonnet-5-5/,
-  /^claude-fable-5/,
-  /^claude-mythos-5/,
-];
+const exactVersion = (id) => new RegExp(`^${id}(?:-\\d{8})?$`);
 
-export const rejectsDisabledThinking = (model) =>
-  REJECTS_DISABLED_THINKING.some((re) => re.test(model ?? ""));
+/** Reject the opt-out whatever the effort. */
+const REJECTS_ALWAYS = [
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+  "claude-fable-5",
+  "claude-fable-5-1",
+  "claude-mythos-5",
+  "claude-mythos-5-1",
+].map(exactVersion);
+
+/** Accept the opt-out at effort `high` or below, reject it above. */
+const REJECTS_ABOVE_HIGH = ["claude-opus-5", "claude-sonnet-5"].map(exactVersion);
+
+const ABOVE_HIGH = ["xhigh", "max"];
+
+export const rejectsDisabledThinking = (model, effort) =>
+  REJECTS_ALWAYS.some((re) => re.test(model ?? "")) ||
+  (REJECTS_ABOVE_HIGH.some((re) => re.test(model ?? "")) && ABOVE_HIGH.includes(effort));
 
 export const THRESHOLDS = {
   /** Below this Jev confidence we refuse to downgrade and cap upgrades at `uncertainCeiling`. */

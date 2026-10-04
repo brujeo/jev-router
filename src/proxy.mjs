@@ -108,8 +108,10 @@ export function applyTier(body, tierName, model = idOf(tierName)) {
   // Some exact models reject an explicit thinking opt-out rather than honouring it, so
   // forwarding one is a guaranteed 400. Dropping the field leaves the model on its default
   // adaptive thinking, which is not what the caller asked for -- so it is decided per model
-  // version, never per family, and never for a model that would have accepted the request.
-  if (body.thinking?.type === "disabled" && rejectsDisabledThinking(model)) {
+  // version, never per family, never for a model that would have accepted the request, and
+  // reported through `adaptationsFor` so overriding a request-level preference is visible in
+  // `/jev-explain` rather than only in a debug log.
+  if (adaptationsFor(body, model).length) {
     delete body.thinking;
     debug(`${model} rejects disabled thinking; dropped the opt-out`);
   }
@@ -125,7 +127,13 @@ export function claudeModels(catalog = []) {
       tier: tierOf(model.id),
       // The account reports each exact model's own limit, which is what a feasibility check
       // has to use: an older version within a tier need not share the family's window.
-      maxInput: model.max_input_tokens ?? null,
+      // Normalised here rather than trusted: a limit arriving as a string survives Math.max
+      // but fails the strict comparison that selects the roomiest candidates, which emptied
+      // the list and crashed the resolver. Anything not a positive finite number is dropped
+      // so the tier's own window is used instead.
+      maxInput: Number.isFinite(Number(model.max_input_tokens)) && Number(model.max_input_tokens) > 0
+        ? Number(model.max_input_tokens)
+        : null,
       description: [
         model.display_name,
         model.created_at && `released ${model.created_at.slice(0, 10)}`,
@@ -140,6 +148,19 @@ export function claudeModels(catalog = []) {
 const modelForTier = (models, tier) => models.find((model) => model.tier === tier)?.id ?? idOf(tier);
 
 const windowOf = (model) => model.maxInput ?? contextWindowForTier(model.tier);
+
+/**
+ * Request-level preferences this tier/model combination cannot carry, as stable labels.
+ *
+ * Kept apart from routing reasons on purpose: an adaptation describes what was done to the
+ * request after a model was chosen, so folding it into the reason string would let it affect
+ * exact-model acceptance, which reads those strings.
+ */
+export const adaptationsFor = (body, model) =>
+  body?.thinking?.type === "disabled" &&
+  rejectsDisabledThinking(model, body?.output_config?.effort)
+    ? ["thinking opt-out removed"]
+    : [];
 
 /**
  * Approximate input size of a request, in tokens, deliberately erring high.
@@ -355,6 +376,8 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             const tier = state.tier ?? current;
             const model = state.model ?? idOf(tier);
             debug(`${key} rewrite ${body.model} -> ${model}`);
+            // Read before applyTier, which is what removes them.
+            const adapted = adaptationsFor(body, model);
             applyTier(body, tier, model);
             // Publish what went out. Claude Code's UI shows the row you picked, not the tier
             // it resolved to, so the status line is the only place this is visible.
@@ -363,7 +386,7 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             // key is stable for the same conversation and is already what `debug` prints, so
             // it is the identifier a user can pass to `jev-explain` for a print-mode run.
             if (fresh && !explaining) {
-              writeDecision(sessionOf(body) || key, { tier, ...fresh, at: Date.now() });
+              writeDecision(sessionOf(body) || key, { tier, ...fresh, adapted, at: Date.now() });
             }
           }
           out = Buffer.from(JSON.stringify(body));
