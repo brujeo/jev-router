@@ -99,3 +99,16 @@ test("a held decision shows the recommendation it refused, not the tier it kept"
   });
   assert(held.includes("CLAUDE-SONNET-5"), "the refused recommendation is not shown");
 });
+
+test("a capacity move is not reported as the hold it overrode", () => {
+  // resolveModel appends +capacity when the settled tier had no candidate that fits, so the
+  // request went somewhere policy did not choose. Reporting the settled reason would describe
+  // a tier it never reached.
+  const held = formatExplanation({
+    tier: "fable", model: "claude-fable-5-1", confidence: 0.4,
+    reason: "jev-unavailable/no-change+capacity",
+  });
+  const line = held.split("\n").find((l) => l.includes("Decision"));
+  assert(!line.includes("held"), `a capacity move still reads as a hold: ${line}`);
+  assert(held.includes("moved to fit"), "the capacity move is not surfaced");
+});

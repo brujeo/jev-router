@@ -12,6 +12,9 @@ const wrapped = (label, value) => {
 };
 
 const decision = (reason = "") => {
+  // Checked first: a capacity move overrides whatever policy had settled on, so reporting the
+  // settled reason instead would describe a tier the request did not go to.
+  if (reason.includes("+capacity")) return "moved to fit the context";
   if (reason.includes("override")) return "prompt override";
   if (reason.includes("jev-unavailable")) return "Jev unavailable; held";
   if (reason.includes("low-confidence-no-downgrade")) return "low confidence; held";
