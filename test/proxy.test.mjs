@@ -14,6 +14,7 @@ import {
   startProxy,
 } from "../src/proxy.mjs";
 import { defaultCandidates } from "../src/config.mjs";
+import { formatExplanation } from "../src/explain.mjs";
 
 test("only the sentinel model is routed", () => {
   assert.equal(isAuto("jev-router"), true);
@@ -656,4 +657,32 @@ test("a model that accepts a thinking opt-out keeps it", async (t) => {
   });
   assert.equal(seen[0].model, "claude-opus-5");
   assert.deepEqual(seen[0].thinking, { type: "disabled" }, "an opt-out this model accepts was removed");
+});
+
+test("a reported context limit is only believed when it is one", () => {
+  // Number() alone would make a boolean a capacity; the family window is the safer fallback.
+  const limit = (max_input_tokens) =>
+    claudeModels([{ id: "claude-opus-5", max_input_tokens }])[0].maxInput;
+  assert.equal(limit(200_000), 200_000);
+  assert.equal(limit("200000"), 200_000, "a numeric string is unambiguous and kept");
+  for (const bogus of [true, false, [200_000], {}, "abc", -5, 0, Infinity, NaN, null, undefined]) {
+    assert.equal(limit(bogus), null, `${JSON.stringify(bogus) ?? "undefined"} became a capacity`);
+  }
+});
+
+test("an adaptation reaches the decision record and the explanation", async (t) => {
+  // The disclosure path end to end: applyTier removes the field, and the user can still see
+  // that their request was changed rather than only that a model was chosen.
+  const { seen, url } = await catalogUpstream(t, [{ id: "claude-opus-5-5", max_input_tokens: 1_000_000 }]);
+  const { port, close } = await startProxy({ upstreamURL: url, route: async () => null });
+  t.after(close);
+  await fetch(`http://127.0.0.1:${port}/v1/models`);
+
+  const convo = `disclose the adaptation ${process.pid}`;
+  await turn(port, convo, { thinking: { type: "disabled" } });
+
+  assert.equal("thinking" in seen[0], false);
+  const status = readStatus(conversationKey({ messages: [{ role: "user", content: convo }] }));
+  assert.deepEqual(status.adapted, ["thinking opt-out removed"]);
+  assert.match(formatExplanation(status), /Adapted:/);
 });

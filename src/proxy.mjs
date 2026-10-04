@@ -105,8 +105,9 @@ export function applyTier(body, tierName, model = idOf(tierName)) {
     delete body.output_config.effort;
     if (Object.keys(body.output_config).length === 0) delete body.output_config;
   }
-  // Some exact models reject an explicit thinking opt-out rather than honouring it, so
-  // forwarding one is a guaranteed 400. Dropping the field leaves the model on its default
+  // Some exact models are documented as rejecting an explicit thinking opt-out rather than
+  // honouring it, so forwarding one is expected to fail. Dropping the field leaves the model
+  // on its default
   // adaptive thinking, which is not what the caller asked for -- so it is decided per model
   // version, never per family, never for a model that would have accepted the request, and
   // reported through `adaptationsFor` so overriding a request-level preference is visible in
@@ -118,6 +119,19 @@ export function applyTier(body, tierName, model = idOf(tierName)) {
   return body;
 }
 
+/**
+ * A context limit as the account reported it, or null to fall back to the tier's window.
+ *
+ * Accepts a number, or a string -- a catalog may report one either way, and a numeric string
+ * is unambiguous. Deliberately not `Number()` on anything: that turns `true` into 1 and
+ * `[200000]` into 200000, and a boolean is not a capacity.
+ */
+const reportedLimit = (value) => {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  const limit = Number(value);
+  return Number.isFinite(limit) && limit > 0 ? limit : null;
+};
+
 /** Exact Claude models reported by the account, newest first; static ids are the cold-start fallback. */
 export function claudeModels(catalog = []) {
   const models = catalog
@@ -127,13 +141,10 @@ export function claudeModels(catalog = []) {
       tier: tierOf(model.id),
       // The account reports each exact model's own limit, which is what a feasibility check
       // has to use: an older version within a tier need not share the family's window.
-      // Normalised here rather than trusted: a limit arriving as a string survives Math.max
-      // but fails the strict comparison that selects the roomiest candidates, which emptied
-      // the list and crashed the resolver. Anything not a positive finite number is dropped
-      // so the tier's own window is used instead.
-      maxInput: Number.isFinite(Number(model.max_input_tokens)) && Number(model.max_input_tokens) > 0
-        ? Number(model.max_input_tokens)
-        : null,
+      // Normalised rather than trusted: a limit arriving as a string survives Math.max, which
+      // coerces, but fails the strict comparison that selects the roomiest candidates -- which
+      // emptied the list and crashed the resolver.
+      maxInput: reportedLimit(model.max_input_tokens),
       description: [
         model.display_name,
         model.created_at && `released ${model.created_at.slice(0, 10)}`,
@@ -376,7 +387,9 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             const tier = state.tier ?? current;
             const model = state.model ?? idOf(tier);
             debug(`${key} rewrite ${body.model} -> ${model}`);
-            // Read before applyTier, which is what removes them.
+            // Read before applyTier, which is what removes them. Recorded per fresh routing
+            // decision, so an adaptation that first applies on a tool continuation mid-turn is
+            // carried out but not separately recorded.
             const adapted = adaptationsFor(body, model);
             applyTier(body, tier, model);
             // Publish what went out. Claude Code's UI shows the row you picked, not the tier
