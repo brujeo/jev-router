@@ -231,7 +231,7 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
               const available = [...new Set(models.map((model) => model.tier))];
               const currentModel = state.model ?? modelForTier(models, current);
               const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
-              const jev = await route({ prompt, current: currentModel, contextTokens, models });
+              const jev = await route({ prompt, current: currentModel, currentTier: current, contextTokens, models });
               const chosen = models.find((model) => model.id === jev?.choice);
               const tierAnswer = jev && { ...jev, choice: chosen?.tier };
               const { tier, reason } = decide({

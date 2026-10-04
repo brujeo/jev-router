@@ -1,7 +1,7 @@
 import { TypeSafeClient } from "@typesafe-ai/sdk";
 import {
   COMPLEXITY_MAX_SCORE,
-  CONTEXT_WINDOW_TOKENS,
+  contextWindowForTier,
   QUESTIONS,
   questionForModels,
   THRESHOLDS,
@@ -27,9 +27,11 @@ function getClient() {
  * Asks Jev which tier fits this prompt. Returns null on any failure, which the policy
  * layer reads as "keep the current model" — routing must never block a prompt.
  *
+ * @param {string} currentTier - The name of the current tier (e.g., 'opus', 'haiku') used
+ *   to determine the correct context window size for the contextSize metric.
  * @returns {Promise<?{choice: string, confidence: number, probabilities: object, metrics: object, ms: number}>}
  */
-export async function askJev({ prompt, current, contextTokens, models }) {
+export async function askJev({ prompt, current, currentTier, contextTokens, models }) {
   if (!models?.length) return null;
   const started = Date.now();
   const abort = new AbortController();
@@ -53,7 +55,7 @@ export async function askJev({ prompt, current, contextTokens, models }) {
         taskComplexity: task_complexity.score / COMPLEXITY_MAX_SCORE,
         reasoningRequired: reasoning_required.score / COMPLEXITY_MAX_SCORE,
         toolComplexity: tool_complexity.score / COMPLEXITY_MAX_SCORE,
-        contextSize: Math.min(contextTokens / CONTEXT_WINDOW_TOKENS, 1),
+        contextSize: Math.min(contextTokens / contextWindowForTier(currentTier), 1),
       },
       ms: Date.now() - started,
     };
