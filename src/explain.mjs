@@ -16,7 +16,7 @@ const decision = (reason = "") => {
   if (reason.includes("jev-unavailable")) return "Jev unavailable; held";
   if (reason.includes("low-confidence-no-downgrade")) return "low confidence; held";
   if (reason.includes("low-confidence-capped")) return "low confidence; capped";
-  if (reason.includes("cache-rebuild")) return "cache rebuild avoided";
+  if (reason.includes("downgrade-confidence-too-low")) return "downgrade not confident enough";
   if (reason.includes("unavailable")) return "nearest available tier";
   return "Jev recommendation";
 };
@@ -27,14 +27,20 @@ export function formatExplanation(status) {
 
   const m = status.metrics ?? {};
   const request = status.jev?.request?.state;
-  const recommendation = status.jev?.response?.answers?.model_tier?.choice ?? status.tier ?? "unknown";
+  // `answers.model` is the key config.mjs asks under, and the choice is an exact model id.
+  // This read was `answers.model_tier`, which never exists, so it always fell through to the
+  // tier that was actually selected -- making a recommendation the policy *refused* look like
+  // the one it followed, which is exactly the case worth seeing.
+  const recommendation =
+    status.jev?.response?.answers?.model?.choice ?? status.tier ?? "unknown";
   return [
     `┌${"─".repeat(WIDTH)}┐`,
     row("Jev Router"),
     row(),
     row("Jev request"),
     ...wrapped("Prompt: ", status.prompt ?? "not recorded"),
-    row(`Current tier: ${(request?.session?.current_model ?? "unknown").toUpperCase()}`),
+    // Model ids are longer than the box is wide, so these wrap rather than silently truncate.
+    ...wrapped("Current tier: ", (request?.session?.current_model ?? "unknown").toUpperCase()),
     row(`Context tokens: ${request?.session?.context_tokens ?? "unknown"}`),
     row(),
     row("Jev response"),
@@ -43,11 +49,11 @@ export function formatExplanation(status) {
     row(`Tool complexity     ${metric(m.toolComplexity)}`),
     row(`Context size        ${metric(m.contextSize)}`),
     row(),
-    row(`Recommended tier: ${recommendation.toUpperCase()}`),
-    row(`Selected model: ${(status.model ?? status.tier ?? "unknown").toUpperCase()}`),
+    ...wrapped("Jev recommended: ", recommendation.toUpperCase()),
+    ...wrapped("Selected model: ", (status.model ?? status.tier ?? "unknown").toUpperCase()),
     row(),
     row(`Confidence: ${status.confidence == null ? "n/a" : `${Math.round(status.confidence * 100)}%`}`),
-    row(`Decision: ${decision(status.reason)}`),
+    ...wrapped("Decision: ", decision(status.reason)),
     `└${"─".repeat(WIDTH)}┘`,
   ].join("\n");
 }
