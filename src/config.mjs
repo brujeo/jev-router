@@ -41,9 +41,26 @@ export const tierOf = (model) =>
 /**
  * Fable bills extra usage credits, so it is opt-in. Everything else is covered by a normal
  * subscription.
+ *
+ * Haiku is excluded for a different reason: at 200k it is the only tier whose context window
+ * is not 1M, which is what stops the session declaring a single honest context budget (Claude
+ * Code resolves the sentinel model to a 200k default and cannot be told a per-tier window).
+ * With Haiku out, every reachable tier is 1M and `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` is
+ * true on every turn. Drop this clause once a 1M Haiku ships.
  */
+/**
+ * Opt-in env flag. These are hand-edited in a `.env` file, where `true` and `yes` are at
+ * least as natural to write as `1`; a strict `=== "1"` silently ignores them, so a tier the
+ * user believes they enabled stays off with nothing to show why. Accepts any of them.
+ */
+const envFlag = (name) => /^\s*(1|true|yes|on)\s*$/i.test(process.env[name] ?? "");
+
 export const availableTiers = () =>
-  TIER_NAMES.filter((n) => n !== "fable" || process.env.JEV_ALLOW_FABLE === "1");
+  TIER_NAMES.filter(
+    (n) =>
+      (n !== "fable" || envFlag("JEV_ALLOW_FABLE")) &&
+      (n !== "haiku" || envFlag("JEV_ALLOW_HAIKU")),
+  );
 
 export const THRESHOLDS = {
   /** Below this Jev confidence we refuse to downgrade and cap upgrades at `uncertainCeiling`. */
@@ -66,7 +83,22 @@ export const THRESHOLDS = {
   jevMaxRetries: 1,
 };
 
-export const CONTEXT_WINDOW_TOKENS = 200000;
+/**
+ * Context window sizes per model tier. Haiku has a smaller context window;
+ * Sonnet, Opus, and Fable all support the full 1M token context.
+ */
+export const CONTEXT_WINDOWS = {
+  haiku: 200000,
+  sonnet: 1000000,
+  opus: 1000000,
+  fable: 1000000,
+};
+
+/**
+ * Get the context window for a given tier. Falls back to a conservative 200K
+ * if the tier is unknown.
+ */
+export const contextWindowForTier = (tierName) => CONTEXT_WINDOWS[tierName] ?? 200000;
 
 const COMPLEXITY_SCALE = [
   "None",

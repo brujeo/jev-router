@@ -88,3 +88,26 @@ test("accepts exact model changes within the same tier", () => {
   assert.equal(shouldUseExactModel("jev/no-change", "opus", "opus"), true);
   assert.equal(shouldUseExactModel("low-confidence-no-downgrade/no-change", "opus", "opus"), false);
 });
+
+test("tier opt-in flags accept the spellings a .env file invites", async (t) => {
+  const { availableTiers } = await import("../src/config.mjs");
+  const saved = { ...process.env };
+  t.after(() => {
+    for (const k of ["JEV_ALLOW_FABLE", "JEV_ALLOW_HAIKU"]) delete process.env[k];
+    Object.assign(process.env, saved);
+  });
+
+  for (const on of ["1", "true", "TRUE", "yes", "on", " true "]) {
+    process.env.JEV_ALLOW_FABLE = on;
+    assert(availableTiers().includes("fable"), `${JSON.stringify(on)} should enable fable`);
+  }
+  for (const off of ["", "0", "false", "no", "off", "disabled"]) {
+    process.env.JEV_ALLOW_FABLE = off;
+    assert(!availableTiers().includes("fable"), `${JSON.stringify(off)} should not enable fable`);
+  }
+
+  // The gate is per tier: enabling one must not enable the other.
+  process.env.JEV_ALLOW_FABLE = "true";
+  process.env.JEV_ALLOW_HAIKU = "false";
+  assert.deepEqual(availableTiers(), ["sonnet", "opus", "fable"]);
+});
