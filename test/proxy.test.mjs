@@ -17,7 +17,7 @@ import {
 test("only the sentinel model is routed", () => {
   assert.equal(isAuto("jev-router"), true);
   assert.equal(isAuto("claude-opus-4-6"), false, "a model the user picked is theirs");
-  assert.equal(isAuto("claude-haiku-4-5-20251001"), false, "internal Haiku calls pass through");
+  assert.equal(isAuto("claude-haiku-4-5"), false, "internal Haiku calls pass through");
   assert.equal(isAuto(undefined), false);
 });
 
@@ -77,7 +77,7 @@ test("routing status retains the exact recent Jev exchanges", () => {
 test("recognises older model versions within a tier", () => {
   assert.equal(tierOf("claude-sonnet-4-6"), "sonnet");
   assert.equal(tierOf("claude-sonnet-5"), "sonnet");
-  assert.equal(tierOf("claude-haiku-4-5-20251001"), "haiku");
+  assert.equal(tierOf("claude-haiku-4-5"), "haiku");
   assert.equal(tierOf("claude-opus-4-1"), "opus");
   assert.equal(tierOf("claude-fable-5-1[1m]"), "fable");
   assert.equal(tierOf("gpt-9"), null);
@@ -153,7 +153,7 @@ test("a routed request without metadata is recorded under the conversation key",
     req.on("data", () => {});
     req.on("end", () => {
       res.setHeader("content-type", "application/json");
-      res.end('{"id":"msg_1","type":"message","model":"claude-sonnet-5"}');
+      res.end('{"id":"msg_1","type":"message","model":"claude-sonnet-5-5"}');
     });
   });
   await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
@@ -161,7 +161,7 @@ test("a routed request without metadata is recorded under the conversation key",
 
   const { port, close } = await startProxy({
     upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
-    route: async () => ({ choice: "claude-sonnet-5", confidence: 0.77, ms: 1 }),
+    route: async () => ({ choice: "claude-sonnet-5-5", confidence: 0.77, ms: 1 }),
   });
   t.after(close);
 
@@ -298,7 +298,7 @@ test("routing to haiku strips fields haiku cannot accept", () => {
     context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
   };
   applyTier(body, "haiku");
-  assert.equal(body.model, "claude-haiku-4-5-20251001");
+  assert.equal(body.model, "claude-haiku-4-5");
   assert.equal(body.thinking, undefined);
   assert.equal(body.output_config, undefined);
   assert.equal(body.context_management, undefined);
@@ -320,7 +320,7 @@ test("routing to opus leaves thinking and effort intact", () => {
     output_config: { effort: "medium" },
   };
   applyTier(body, "opus");
-  assert.equal(body.model, "claude-opus-5");
+  assert.equal(body.model, "claude-opus-5-5");
   assert.deepEqual(body.thinking, { type: "adaptive" });
   assert.deepEqual(body.output_config, { effort: "medium" });
 });
@@ -382,49 +382,77 @@ test("the key survives metadata that is not JSON", () => {
 });
 
 test("the feasibility filter cannot be bypassed by the model it resolves to", () => {
-  // A predicate test passes even if the proxy stops calling it, so these drive the two
-  // selection paths that actually choose what gets forwarded.
   const small = { id: "claude-opus-4-1", tier: "opus", maxInput: 200_000 };
-  const bigOpus = { id: "claude-opus-5", tier: "opus", maxInput: 1_000_000 };
-  const bigSonnet = { id: "claude-sonnet-5", tier: "sonnet", maxInput: 1_000_000 };
+  const bigOpus = { id: "claude-opus-5-5", tier: "opus", maxInput: 1_000_000 };
+  const bigSonnet = { id: "claude-sonnet-5-5", tier: "sonnet", maxInput: 1_000_000 };
   const offered = [small, bigOpus, bigSonnet];
 
   const { models, oversized } = feasibleModels(offered, 500_000);
   assert.equal(oversized, false);
-  assert.deepEqual(models.map((m) => m.id), ["claude-opus-5", "claude-sonnet-5"]);
+  assert.deepEqual(models.map((m) => m.id), ["claude-opus-5-5", "claude-sonnet-5-5"]);
 
   // A held decision must not resurrect the session's pinned model once it is ineligible.
-  assert.equal(
+  assert.deepEqual(
     resolveModel({
       models, tier: "opus", current: "opus",
       currentModel: small.id, chosen: null, reason: "downgrade-confidence-too-low/no-change",
     }),
-    bigOpus.id,
+    { model: bigOpus.id, tier: "opus", reason: "downgrade-confidence-too-low/no-change" },
   );
   // An eligible pinned model is still preferred, so a hold does not churn the cache.
   assert.equal(
     resolveModel({
       models, tier: "opus", current: "opus",
       currentModel: bigOpus.id, chosen: null, reason: "jev/no-change",
-    }),
+    }).model,
     bigOpus.id,
   );
   // Jev failure and an explicit override take the same resolution path.
   for (const reason of ["jev-unavailable/no-change", "override/no-change"]) {
     assert.equal(
-      resolveModel({ models, tier: "opus", current: "opus", currentModel: small.id, chosen: null, reason }),
+      resolveModel({ models, tier: "opus", current: "opus", currentModel: small.id, chosen: null, reason }).model,
       bigOpus.id,
     );
   }
   // An exact answer is only honoured if it survived filtering.
   assert.equal(
-    resolveModel({ models, tier: "opus", current: "sonnet", chosen: small, reason: "jev" }),
+    resolveModel({ models, tier: "opus", current: "sonnet", chosen: small, reason: "jev" }).model,
     bigOpus.id,
   );
-  // Settling on a tier with no eligible model still forwards an eligible one.
-  assert.equal(
-    resolveModel({ models: [bigSonnet], tier: "opus", current: "opus", currentModel: small.id, chosen: null, reason: "jev-unavailable/no-change" }),
-    bigSonnet.id,
+  // Nothing to choose between at all is reported rather than papered over with a static id.
+  assert.equal(resolveModel({ models: [], tier: "opus", current: "opus", chosen: null, reason: "jev" }), null);
+});
+
+test("a capacity fallback across tiers reports the tier it actually landed on", () => {
+  // The settled tier has no eligible candidate, so staying in the window means leaving it.
+  // The returned tier must be the new one: applyTier adapts with that tier's flags, and it
+  // becomes the `current` the next turn compares against. Returning the settled tier instead
+  // would strip a Fable request using Haiku's flags and hide the next real downgrade.
+  const onlyFable = [{ id: "claude-fable-5-1", tier: "fable", maxInput: 1_000_000 }];
+  const out = resolveModel({
+    models: onlyFable, tier: "haiku", current: "haiku",
+    currentModel: "claude-haiku-4-5", chosen: null, reason: "jev-unavailable/no-change",
+  });
+  assert.equal(out.model, "claude-fable-5-1");
+  assert.equal(out.tier, "fable", "the reported tier must follow the model actually chosen");
+  assert.match(out.reason, /\+capacity/, "entering a tier for capacity must not be silent");
+
+  // And the flags used downstream are the chosen tier's, so thinking survives.
+  const body = applyTier({ model: "jev-router", thinking: { type: "adaptive" } }, out.tier, out.model);
+  assert.equal(body.model, "claude-fable-5-1");
+  assert.deepEqual(body.thinking, { type: "adaptive" });
+});
+
+test("a tier that cannot be told not to think drops the opt-out instead of forwarding it", () => {
+  // Opus 5.5 rejects thinking:{type:"disabled"} at every effort, so forwarding it is a 400.
+  const body = applyTier({ model: "jev-router", thinking: { type: "disabled" } }, "opus");
+  assert.equal("thinking" in body, false);
+  // Haiku has no thinking support at all; the field goes for the other reason.
+  assert.equal("thinking" in applyTier({ model: "x", thinking: { type: "disabled" } }, "haiku"), false);
+  // An adaptive request is untouched on a thinking tier.
+  assert.deepEqual(
+    applyTier({ model: "x", thinking: { type: "adaptive" } }, "opus").thinking,
+    { type: "adaptive" },
   );
 });
 

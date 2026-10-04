@@ -103,6 +103,10 @@ export function applyTier(body, tierName, model = idOf(tierName)) {
     delete body.output_config.effort;
     if (Object.keys(body.output_config).length === 0) delete body.output_config;
   }
+  // Tiers that cannot be told not to think reject an explicit opt-out outright, so routing a
+  // thinking-disabled request into one has to drop the field rather than forward it. Omitting
+  // it leaves the model on adaptive thinking, which is what these tiers do by default anyway.
+  if (tier.mustThink && body.thinking?.type === "disabled") delete body.thinking;
   return body;
 }
 
@@ -164,21 +168,44 @@ export function feasibleModels(offered, contextTokens) {
 }
 
 /**
- * The exact model id to forward.
+ * The final selection: `{model, tier, reason}`, or null when `models` is empty.
+ *
+ * Returns the tier of the model it picked rather than the tier policy settled on, because the
+ * two can diverge. Everything downstream has to follow the model actually sent: `applyTier`
+ * strips fields using that tier's capability flags, `state.tier` becomes the `current` the
+ * next turn compares against, and a mismatch there is not cosmetic -- adapting a Fable
+ * request with Haiku's flags strips thinking it needs, and recording Haiku while running
+ * Fable makes the next turn's real downgrade invisible to the confidence gate.
  *
  * Every branch resolves against `models`, the already-filtered candidate list. Reusing the
- * model pinned to the session, or falling back to a tier's static default, would otherwise
- * resurrect a model the conversation has outgrown: holding the current tier is the common
- * path, and the session's pinned model is exactly the one most likely to predate the growth.
- * Settlement can also land on a tier with no eligible model at all -- `clampToAvailable`
- * declines to step up into the paid tier, so a conversation only Fable can hold settles back
- * onto an unusable tier -- and that must not forward an ineligible id either.
+ * model pinned to the session would otherwise resurrect one the conversation has outgrown:
+ * holding the current tier is the common path and the pinned model is exactly the one most
+ * likely to predate the growth.
  */
 export function resolveModel({ models, tier, current, currentModel, chosen, reason }) {
-  const eligible = (id) => id != null && models.some((model) => model.id === id);
-  if (shouldUseExactModel(reason, chosen?.tier, tier) && eligible(chosen?.id)) return chosen.id;
-  if (tier === current && eligible(currentModel)) return currentModel;
-  return models.find((model) => model.tier === tier)?.id ?? models[0]?.id ?? idOf(tier);
+  if (!models.length) return null;
+  const of = (id) => models.find((model) => model.id === id);
+  const as = (model, extra = "") =>
+    model && { model: model.id, tier: model.tier, reason: `${reason}${extra}` };
+
+  if (shouldUseExactModel(reason, chosen?.tier, tier)) {
+    const exact = as(of(chosen?.id));
+    if (exact) return exact;
+  }
+  if (tier === current) {
+    const held = as(of(currentModel));
+    if (held) return held;
+  }
+  const inTier = as(models.find((model) => model.tier === tier));
+  if (inTier) return inTier;
+
+  // Nothing in the settled tier survived the size filter, so staying inside the window means
+  // leaving the tier. That is a capacity transition rather than a routing preference, and it
+  // is the one path that can enter the paid tier unasked -- `clampToAvailable` declines that
+  // for cost, but cost is not a reason it can honour when nothing else holds the
+  // conversation. Reported as `+capacity` so the move is never silent.
+  const roomiest = [...models].sort((a, b) => windowOf(b) - windowOf(a))[0];
+  return as(roomiest, "+capacity");
 }
 
 /**
@@ -270,13 +297,18 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             const prompt = newTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>");
             let fresh = null;
-            if (prompt && !explaining) {
+            const offered = claudeModels([...catalog.values()]).filter((model) =>
+              availableTiers().includes(model.tier),
+            );
+            // No candidates at all -- a catalog whose every recognised tier is gated off by
+            // the opt-in flags. There is nothing to choose between, and inventing a static id
+            // here would forward a model no filter ever saw, so the turn is left alone.
+            if (prompt && !explaining && offered.length) {
               const contextTokens = estimateInputTokens(body);
-              const offered = claudeModels([...catalog.values()]).filter((model) =>
-                availableTiers().includes(model.tier),
-              );
               const { models, oversized } = feasibleModels(offered, contextTokens);
-              if (oversized) debug(`${key} ctx~${contextTokens} exceeds every window`);
+              if (oversized) {
+                debug(`${key} ctx~${contextTokens}: no candidate fits the estimate with headroom`);
+              }
               const available = [...new Set(models.map((model) => model.tier))];
               // The pinned model is only a starting point if it is still eligible; otherwise
               // it is precisely the stale choice the filter just rejected.
@@ -286,8 +318,16 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
               const jev = await route({ prompt, current: currentModel, currentTier: current, contextTokens, models });
               const chosen = models.find((model) => model.id === jev?.choice);
               const tierAnswer = jev && { ...jev, choice: chosen?.tier };
-              const { tier, reason } = decide({ prompt, jev: tierAnswer, current, available });
-              const model = resolveModel({ models, tier, current, currentModel, chosen, reason });
+              const settled = decide({ prompt, jev: tierAnswer, current, available });
+              // The selection's own tier, not the settled one: see resolveModel.
+              const { model, tier, reason } = resolveModel({
+                models,
+                tier: settled.tier,
+                current,
+                currentModel,
+                chosen,
+                reason: settled.reason,
+              });
               state.tier = tier;
               state.model = model;
               fresh = {
@@ -296,12 +336,15 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
                 confidence: jev?.confidence ?? null,
                 metrics: jev?.metrics ?? null,
                 reason,
+                oversized,
                 jev: jev ? { request: jev.request, response: jev.response } : null,
               };
               debug(
                 `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
                   `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
               );
+            } else if (prompt && !explaining) {
+              debug(`${key} no candidate models available; leaving ${current} alone`);
             }
             // The sentinel is not a real model, so every routed request must be rewritten,
             // including follow-ups that reuse the tier chosen for the turn.

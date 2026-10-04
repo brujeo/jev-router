@@ -2,17 +2,29 @@
 import { choice, score } from "@typesafe-ai/sdk";
 
 /**
- * Model tiers, cheapest first. `id` is what goes into the API request body; `family` is the
- * substring used to recognise whatever model Claude Code asked for, which may be an older
- * version within the same tier such as `claude-sonnet-4-6`. The capability flags come from
- * the Agent SDK's model catalogue: Haiku supports neither adaptive thinking nor effort, so
- * those fields have to be stripped when routing down to it.
+ * Model tiers, cheapest first. `id` is the static default that goes into the request body
+ * when the account catalog has not been read yet; `family` is the substring used to recognise
+ * whatever model Claude Code asked for, which may be an older version within the same tier
+ * such as `claude-sonnet-4-6`.
+ *
+ * The flags describe what a tier's request body may contain. `thinking` and `effort` are
+ * capabilities: Haiku supports neither adaptive thinking nor effort, so those fields are
+ * stripped when routing down to it. `mustThink` is the opposite -- the tier rejects an
+ * explicit `thinking: {type: "disabled"}` outright, so the field has to be dropped rather
+ * than forwarded, which leaves the model on its default adaptive thinking.
+ *
+ * `mustThink` is deliberately conservative at the family level. A catalog can offer two
+ * versions of one tier that disagree (Opus 5 accepts disabled thinking at effort `high` or
+ * below; Opus 5.5 rejects it at every effort), and `tierOf()` maps both to `opus`, so the
+ * flag cannot distinguish them. Dropping the field for the whole family is safe either way:
+ * on the version that would have accepted it the model simply thinks adaptively, where the
+ * alternative on the version that does not is a hard 400.
  */
 export const TIERS = [
-  { name: "haiku", id: "claude-haiku-4-5-20251001", family: "haiku", thinking: false, effort: false },
-  { name: "sonnet", id: "claude-sonnet-5", family: "sonnet", thinking: true, effort: true },
-  { name: "opus", id: "claude-opus-5", family: "opus", thinking: true, effort: true },
-  { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true },
+  { name: "haiku", id: "claude-haiku-4-5", family: "haiku", thinking: false, effort: false },
+  { name: "sonnet", id: "claude-sonnet-5-5", family: "sonnet", thinking: true, effort: true, mustThink: true },
+  { name: "opus", id: "claude-opus-5-5", family: "opus", thinking: true, effort: true, mustThink: true },
+  { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true, mustThink: true },
 ];
 
 export const TIER_NAMES = TIERS.map((t) => t.name);
