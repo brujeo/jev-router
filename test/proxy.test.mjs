@@ -7,6 +7,9 @@ import {
   applyTier,
   claudeModels,
   conversationKey,
+  estimateInputTokens,
+  feasibleModels,
+  resolveModel,
   sessionOf,
   startProxy,
 } from "../src/proxy.mjs";
@@ -376,4 +379,74 @@ test("the same opening text in two sessions gets two keys", () => {
 test("the key survives metadata that is not JSON", () => {
   const body = { metadata: { user_id: "not-json" }, messages: [{ role: "user", content: "hi" }] };
   assert.doesNotThrow(() => conversationKey(body));
+});
+
+test("the feasibility filter cannot be bypassed by the model it resolves to", () => {
+  // A predicate test passes even if the proxy stops calling it, so these drive the two
+  // selection paths that actually choose what gets forwarded.
+  const small = { id: "claude-opus-4-1", tier: "opus", maxInput: 200_000 };
+  const bigOpus = { id: "claude-opus-5", tier: "opus", maxInput: 1_000_000 };
+  const bigSonnet = { id: "claude-sonnet-5", tier: "sonnet", maxInput: 1_000_000 };
+  const offered = [small, bigOpus, bigSonnet];
+
+  const { models, oversized } = feasibleModels(offered, 500_000);
+  assert.equal(oversized, false);
+  assert.deepEqual(models.map((m) => m.id), ["claude-opus-5", "claude-sonnet-5"]);
+
+  // A held decision must not resurrect the session's pinned model once it is ineligible.
+  assert.equal(
+    resolveModel({
+      models, tier: "opus", current: "opus",
+      currentModel: small.id, chosen: null, reason: "downgrade-confidence-too-low/no-change",
+    }),
+    bigOpus.id,
+  );
+  // An eligible pinned model is still preferred, so a hold does not churn the cache.
+  assert.equal(
+    resolveModel({
+      models, tier: "opus", current: "opus",
+      currentModel: bigOpus.id, chosen: null, reason: "jev/no-change",
+    }),
+    bigOpus.id,
+  );
+  // Jev failure and an explicit override take the same resolution path.
+  for (const reason of ["jev-unavailable/no-change", "override/no-change"]) {
+    assert.equal(
+      resolveModel({ models, tier: "opus", current: "opus", currentModel: small.id, chosen: null, reason }),
+      bigOpus.id,
+    );
+  }
+  // An exact answer is only honoured if it survived filtering.
+  assert.equal(
+    resolveModel({ models, tier: "opus", current: "sonnet", chosen: small, reason: "jev" }),
+    bigOpus.id,
+  );
+  // Settling on a tier with no eligible model still forwards an eligible one.
+  assert.equal(
+    resolveModel({ models: [bigSonnet], tier: "opus", current: "opus", currentModel: small.id, chosen: null, reason: "jev-unavailable/no-change" }),
+    bigSonnet.id,
+  );
+});
+
+test("a conversation past every window is offered only the roomiest models", () => {
+  const haiku = { id: "claude-haiku-4-5", tier: "haiku", maxInput: 200_000 };
+  const sonnet = { id: "claude-sonnet-5", tier: "sonnet", maxInput: 1_000_000 };
+  const opus = { id: "claude-opus-5", tier: "opus", maxInput: 1_000_000 };
+
+  const { models, oversized } = feasibleModels([haiku, sonnet, opus], 2_000_000);
+  assert.equal(oversized, true);
+  // Not the full list: answering "too big for every window" with the smallest window is the
+  // one choice that cannot help. The API refuses it instead.
+  assert.deepEqual(models.map((m) => m.id).sort(), ["claude-opus-5", "claude-sonnet-5"]);
+  assert.equal(models.some((m) => m.tier === "haiku"), false);
+});
+
+test("the size estimate counts tools and system, not just messages", () => {
+  const messages = [{ role: "user", content: "hi" }];
+  const withTools = estimateInputTokens({ messages, tools: [{ name: "x", description: "y".repeat(4000) }] });
+  const withSystem = estimateInputTokens({ messages, system: "z".repeat(4000) });
+  const bare = estimateInputTokens({ messages });
+  assert(withTools > bare + 900, "a large tool surface must raise the estimate");
+  assert(withSystem > bare + 900, "a large system prompt must raise the estimate");
+  assert.equal(estimateInputTokens({}), 0);
 });

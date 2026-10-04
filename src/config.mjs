@@ -82,8 +82,10 @@ export const THRESHOLDS = {
    * refused downgrades once a conversation passed 20k on the reasoning that the rebuild had
    * stopped being worth it. That threshold was an uncalibrated approximation and it blocks
    * switches that are profitable over a long enough run: the rebuild scales with the prefix
-   * and so does most of the saving it buys, so payback is counted in *requests*, not tokens --
-   * roughly 1-8 for opus->sonnet across the whole range of context sizes.
+   * and so does most of the saving it buys, so payback is counted in *requests*, not tokens.
+   * Switching costs `prefix * (write_new - read_new)` once -- not the whole write, since
+   * staying would also have paid a read -- against `prefix * (read_old - read_new)` plus the
+   * output-price difference on every later request.
    *
    * Those figures are an estimate, not a measurement: they assume a stable cacheable prefix,
    * a warm old cache against a cold new one, comparable output volume per request, the 5-minute
@@ -130,16 +132,30 @@ export const CONTEXT_WINDOWS = {
 export const contextWindowForTier = (tierName) => CONTEXT_WINDOWS[tierName] ?? 200000;
 
 /**
- * Whether a conversation still fits a candidate model's context window.
+ * Multiplier applied to an estimated token count before comparing it against a model's
+ * limit. The size of a request is estimated from serialised characters, which is neither a
+ * token count nor an upper bound on one: JSON punctuation inflates it, while token-dense
+ * text deflates it. The only safe direction for a feasibility error is to treat the request
+ * as larger than measured, so the headroom reduces usable capacity and never extends it.
+ */
+export const FEASIBILITY_HEADROOM = 1.15;
+
+/**
+ * Whether a conversation plausibly still fits a candidate model's context window.
  *
  * Feasibility, not economics: routing a conversation to a model that cannot hold it is a
- * hard API rejection, not an expensive choice, so it is filtered out of the candidate list
- * before Jev ever sees it rather than weighed against cost in `decide()`. Prefers the exact
- * limit the account reported for that model over the tier's family window, because an older
- * version within a tier need not match it.
+ * hard API rejection rather than an expensive choice, so candidates are dropped from the
+ * list before Jev ever sees them instead of being weighed against cost in `decide()`.
+ * Prefers the exact limit the account reported for that model over the tier's family
+ * window, because an older version within a tier need not match it.
+ *
+ * "Plausibly" is the honest word: the input is an estimate, so this reduces the chance of
+ * routing into a window the conversation has outgrown but cannot guarantee a fit. It is a
+ * routing-time safeguard -- tool continuations within a turn reuse the tier already chosen
+ * and are not re-checked.
  */
 export const modelFitsContext = (model, contextTokens = 0) =>
-  contextTokens <= (model?.maxInput ?? contextWindowForTier(model?.tier));
+  contextTokens * FEASIBILITY_HEADROOM <= (model?.maxInput ?? contextWindowForTier(model?.tier));
 
 const COMPLEXITY_SCALE = [
   "None",

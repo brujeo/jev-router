@@ -40,7 +40,7 @@ export function formatExplanation(status) {
     row("Jev request"),
     ...wrapped("Prompt: ", status.prompt ?? "not recorded"),
     // Model ids are longer than the box is wide, so these wrap rather than silently truncate.
-    ...wrapped("Current tier: ", (request?.session?.current_model ?? "unknown").toUpperCase()),
+    ...wrapped("Current model: ", (request?.session?.current_model ?? "unknown").toUpperCase()),
     row(`Context tokens: ${request?.session?.context_tokens ?? "unknown"}`),
     row(),
     row("Jev response"),

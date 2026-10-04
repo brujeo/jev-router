@@ -194,8 +194,11 @@ One Jev call per fresh user turn selects a shared abstract tier:
 - failure, timeout, or an unrecognised Jev answer keeps the current model;
 - low confidence never downgrades and caps upgrades at the balanced tier;
 - downgrades need higher confidence than upgrades, because switching rebuilds the prompt
-  cache and a cheaper model that cannot finish the work costs more than it saves;
-- a tier whose context window the conversation has outgrown is never offered;
+  cache and a cheaper model that cannot finish the work can erase the savings;
+- when a new turn is routed, exact models whose reported input limit the conversation has
+  outgrown are dropped from the candidates, using an estimated size with headroom; if it
+  fits none of them only the roomiest are offered. Claude only -- the Codex path does not
+  filter on capacity;
 - unavailable tiers step upward rather than silently choosing a weaker model;
 - the long tier is disabled unless `JEV_ALLOW_FABLE` is set (`1`, `true`, `yes` or `on`);
 - the fast tier is disabled unless `JEV_ALLOW_HAIKU` is set the same way, because it is the

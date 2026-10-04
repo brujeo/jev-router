@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { decide, detectOverride } from "../src/policy.mjs";
-import { QUESTIONS, modelFitsContext, shouldUseExactModel } from "../src/config.mjs";
+import {
+  FEASIBILITY_HEADROOM,
+  QUESTIONS,
+  modelFitsContext,
+  shouldUseExactModel,
+} from "../src/config.mjs";
 
 const ALL = ["haiku", "sonnet", "opus", "fable"];
 const sure = (choice) => ({ choice, confidence: 0.95 });
@@ -91,7 +96,7 @@ test("the confidence bar applies only downward", () => {
   assert.equal(decide({ ...base, current: "sonnet", jev: mid }).tier, "opus");
 });
 
-test("the effective downgrade bar is max(minConfidence, downgradeMinConfidence)", () => {
+test("the downgrade confidence boundaries, as configured today", () => {
   // Two thresholds govern downgrades, and the stricter always wins. Lowering
   // downgradeMinConfidence below minConfidence would NOT lower the effective bar, because the
   // minConfidence branch runs first -- only the reason string changes. Pin both boundaries.
@@ -147,7 +152,7 @@ test("tier opt-in flags accept the spellings a .env file invites", async (t) => 
   assert.deepEqual(availableTiers(), ["sonnet", "opus", "fable"]);
 });
 
-test("a conversation cannot be routed into a window it has outgrown", () => {
+test("modelFitsContext prefers the exact reported limit, with headroom", () => {
   // Feasibility is enforced on the candidate list, not in decide(): the exact limit the
   // account reported wins over the tier's family window, since an older version within a
   // tier need not match it.
@@ -155,9 +160,14 @@ test("a conversation cannot be routed into a window it has outgrown", () => {
   const sonnet = { id: "claude-sonnet-5", tier: "sonnet", maxInput: 1_000_000 };
 
   assert.equal(modelFitsContext(haiku, 50_000), true);
-  assert.equal(modelFitsContext(haiku, 200_000), true); // exactly at the limit still fits
-  assert.equal(modelFitsContext(haiku, 200_001), false);
-  assert.equal(modelFitsContext(sonnet, 900_000), true);
+  assert.equal(modelFitsContext(sonnet, 800_000), true);
+
+  // The input is an estimate, so headroom is applied against the limit: a conversation
+  // measured at exactly the window no longer counts as fitting, because the measurement
+  // could be under. The headroom only ever reduces usable capacity.
+  assert.equal(modelFitsContext(haiku, 200_000), false);
+  assert.equal(modelFitsContext(haiku, Math.floor(200_000 / FEASIBILITY_HEADROOM)), true);
+  assert.equal(modelFitsContext(haiku, Math.ceil(200_000 / FEASIBILITY_HEADROOM) + 1), false);
 
   // An exact limit narrower than its family window is respected.
   assert.equal(modelFitsContext({ tier: "sonnet", maxInput: 200_000 }, 500_000), false);

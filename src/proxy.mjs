@@ -7,6 +7,7 @@ import {
   tierOf,
   idOf,
   availableTiers,
+  contextWindowForTier,
   tierSpec,
   isAuto,
   modelFitsContext,
@@ -128,6 +129,58 @@ export function claudeModels(catalog = []) {
 
 const modelForTier = (models, tier) => models.find((model) => model.tier === tier)?.id ?? idOf(tier);
 
+const windowOf = (model) => model.maxInput ?? contextWindowForTier(model.tier);
+
+/**
+ * Approximate input size of a request, in tokens, deliberately erring high.
+ *
+ * Counts `system` and `tools` as well as `messages`, because all three are input the window
+ * has to hold -- counting messages alone understates a request carrying a large tool
+ * surface. Characters/4 remains an approximation, which is why `modelFitsContext` applies
+ * headroom on top rather than trusting this as a bound.
+ */
+export const estimateInputTokens = (body) =>
+  Math.round(
+    [body?.messages, body?.system, body?.tools]
+      .filter((part) => part != null)
+      .reduce((chars, part) => chars + JSON.stringify(part).length, 0) / 4,
+  );
+
+/**
+ * Candidates to route among, given everything the account offers.
+ *
+ * Normally those the conversation still fits. When it fits none of them it has outgrown
+ * every tier, and the estimate is approximate enough that the API may still accept the
+ * request -- but letting a cheapest-first classifier choose among candidates already
+ * rejected for capacity is the one outcome that cannot help, since it would answer "too big
+ * for every window" with the smallest window available. Offer only the roomiest instead and
+ * let the API be the one to refuse.
+ */
+export function feasibleModels(offered, contextTokens) {
+  const fitting = offered.filter((model) => modelFitsContext(model, contextTokens));
+  if (fitting.length) return { models: fitting, oversized: false };
+  const widest = Math.max(...offered.map(windowOf), 0);
+  return { models: offered.filter((model) => windowOf(model) === widest), oversized: true };
+}
+
+/**
+ * The exact model id to forward.
+ *
+ * Every branch resolves against `models`, the already-filtered candidate list. Reusing the
+ * model pinned to the session, or falling back to a tier's static default, would otherwise
+ * resurrect a model the conversation has outgrown: holding the current tier is the common
+ * path, and the session's pinned model is exactly the one most likely to predate the growth.
+ * Settlement can also land on a tier with no eligible model at all -- `clampToAvailable`
+ * declines to step up into the paid tier, so a conversation only Fable can hold settles back
+ * onto an unusable tier -- and that must not forward an ineligible id either.
+ */
+export function resolveModel({ models, tier, current, currentModel, chosen, reason }) {
+  const eligible = (id) => id != null && models.some((model) => model.id === id);
+  if (shouldUseExactModel(reason, chosen?.tier, tier) && eligible(chosen?.id)) return chosen.id;
+  if (tier === current && eligible(currentModel)) return currentModel;
+  return models.find((model) => model.tier === tier)?.id ?? models[0]?.id ?? idOf(tier);
+}
+
 /**
  * Identifies the conversation a request belongs to. Claude Code runs sub-agents through the
  * same endpoint, so a single pinned model would let a sub-agent's choice leak into the main
@@ -218,28 +271,23 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             const explaining = prompt?.includes("<jev-explain>");
             let fresh = null;
             if (prompt && !explaining) {
-              const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
+              const contextTokens = estimateInputTokens(body);
               const offered = claudeModels([...catalog.values()]).filter((model) =>
                 availableTiers().includes(model.tier),
               );
-              // Drop candidates the conversation has outgrown, so a confident recommendation
-              // cannot route a large conversation into a small window. If nothing fits, the
-              // request is oversized whatever we pick, so keep the full list and let the API
-              // be the one to say so rather than silently holding the session on one tier.
-              const fitting = offered.filter((model) => modelFitsContext(model, contextTokens));
-              const models = fitting.length ? fitting : offered;
+              const { models, oversized } = feasibleModels(offered, contextTokens);
+              if (oversized) debug(`${key} ctx~${contextTokens} exceeds every window`);
               const available = [...new Set(models.map((model) => model.tier))];
-              const currentModel = state.model ?? modelForTier(models, current);
+              // The pinned model is only a starting point if it is still eligible; otherwise
+              // it is precisely the stale choice the filter just rejected.
+              const currentModel = models.some((model) => model.id === state.model)
+                ? state.model
+                : modelForTier(models, current);
               const jev = await route({ prompt, current: currentModel, currentTier: current, contextTokens, models });
               const chosen = models.find((model) => model.id === jev?.choice);
               const tierAnswer = jev && { ...jev, choice: chosen?.tier };
               const { tier, reason } = decide({ prompt, jev: tierAnswer, current, available });
-              const model =
-                shouldUseExactModel(reason, chosen?.tier, tier)
-                  ? chosen.id
-                  : tier === current
-                    ? currentModel
-                    : modelForTier(models, tier);
+              const model = resolveModel({ models, tier, current, currentModel, chosen, reason });
               state.tier = tier;
               state.model = model;
               fresh = {
